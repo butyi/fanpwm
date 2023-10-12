@@ -1,0 +1,182 @@
+; ===================== CONFIG =================================================
+
+CANTIMEOUT      equ     255             ; Message timeout in 10ms 
+
+; CAN ID structure
+;  11bit ID is used.
+;  0000 0000 1111 1xxx, where 0 means CANIDAR0, 1 means CANIDAR1, x means don't care
+;  PPDD DDDD MMMR Ixxx, where P is Priority (to be skipped), D is Destination node ID, M is Message of node, R is RTR(0), I is IDE(0), x is don't care 
+BCDI            equ     $3F             ; BroadCast Destination Id
+MYDI            equ     $05             ; MY Destination Id (heater control node) 
+
+; ====================  CONSTANTS  =============================================
+
+PRIO_L          equ     $C0 
+PRIO_ML         equ     $80 
+PRIO_MH         equ     $40 
+PRIO_H          equ     $00 
+
+MSG_7           equ     $E0
+MSG_6           equ     $C0
+MSG_5           equ     $A0
+MSG_4           equ     $80
+MSG_3           equ     $60
+MSG_2           equ     $40
+MSG_1           equ     $20
+MSG_0           equ     $00
+
+; ====================  VARIABLES  =============================================
+#RAM
+
+canpwm          ds      1       ; PWM value received from CAN. 255 means SNA (SignalNotAvailable)
+
+; ===================== SUB-ROUTINES ===========================================
+#ROM
+
+; ------------------------------------------------------------------------------
+; Freescale Controller Area Network (S08MSCANV1)
+; Set up CAN for 250 kbit/s using 4 MHz external clock
+; CAN will use in interrupt mode, but init does not enable interrupt.
+; It will be enabled when transmission can be started, so when
+; all bytes have been received from SCI.
+;
+;   Baud = fCANCLK / Prescaler / (1 + Tseg1 + Tseg2) = 
+;     4MHz / 2 / (1+5+2) = 250k 
+;   Sample point = 75% 
+;     (1 + Tseg1)/(1 + Tseg1 + Tseg2) = (1+5)/(1+5+2) = 0.75
+CAN_Init
+        ; MSCAN Enable
+        lda     #CAN_CANE_      ; Auto BusOff recovery
+        sta     CANCTL1
+
+        ; Wait for Initialization Mode Acknowledge
+ican1
+        lda     CANCTL1
+        and     #CAN_INITAK_
+        beq     ican1
+
+        ; SJW = 1 Tq, Prescaler value (P) = 2
+        lda     #1
+        sta     CANBTR0
+        
+        ; One sample per bit, Tseg2 = 2, Tseg1 = 5
+        lda     #$14
+        sta     CANBTR1
+
+        ; Acceptance filter for Rx
+        clra
+        sta     CANIDAC         ; Two 32-bit acceptance filters
+        lda     #MYDI
+        sta     CANIDAR0
+        lda     #$C0            ; Ignore P, match D     
+        sta     CANIDMR0
+        clra                    ; M(Message)=0, R(RTR)=0, I(IDE)=0, x(don't care)=0
+        sta     CANIDAR1        
+        lda     #$E7            ; Match only R and I     
+        sta     CANIDMR1
+        
+        clra                    ; 0 (not used for 11bit IDs)
+        sta     CANIDAR2
+        sta     CANIDAR3
+        coma                    ; $FF = ignore all bits
+        sta     CANIDMR2
+        sta     CANIDMR3
+
+        ; Leave Initialization Mode
+        clra
+        sta     CANCTL0
+
+        ; Wait for exit Initialization Mode Acknowledge
+ican2
+        lda     CANCTL1
+        and     #CAN_INITAK_
+        bne     ican2
+        
+        ; Enable Rx interrupt
+        lda     #CAN_RXFIE_
+        sta     CANRIER
+
+        ; Init module variables
+        mov     #255,canpwm     ; Init to SNA
+        
+        rts
+
+CANSendHB
+        ; Send heartbit message
+        
+        ; Select first buffer
+        lda     #1
+        sta     CANTBSEL
+
+        ; Set ID (P=11b D=111111b M=111b = 7FF)
+        lda     #PRIO_L|BCDI
+        sta     CANTIDR0
+        lda     #MSG_7
+        sta     CANTIDR1        ; Clear M, R, I
+        
+        ; Set message data
+        lda     #MYDI
+        sta     CANTDSR0
+        clra                    ; Status
+        sta     CANTDSR1
+
+        ; Set data length
+        lda     #2
+        sta     CANTDLR
+
+        ; Transmit the message
+        lda     CANTBSEL
+        sta     CANTFLG
+
+        rts
+
+CANTask
+        ; check and handle CAN timeout
+        tst     canrxto
+        bne     cr_nto          ; Jump if no timeout
+        mov     #255,canpwm     ; Set SNA
+cr_nto    
+        tst     cantxhb
+        bne     cr_nhb          ; Jump if time not yet elapsed
+        bsr     CANSendHB
+        mov     #100,cantxhb    ; Pull timer again 1s
+cr_nhb        
+        rts
+        
+
+CAN_Rx_IT                       ; If message was received
+        pshh
+        ; Check which message is arrived
+        lda     CANRIDR1
+        and     #$E0
+        nsa
+        lsra
+        bne     cr_dm           ; Jump if MMM != 0
+        
+        ; Check DLC
+        lda     CANRDLR
+        cmp     #2
+        bne     cr_dm
+        
+        ; Handle data
+        lda     CANRDSR1        ; Byte 1
+        cmp     #100            ; Check for maximum percent
+        bhi     cr_dm           ; if more than 100% (or SNA), do not use 
+        sta     canpwm
+        lda     #CANTIMEOUT
+        sta     canrxto         ; Pull timeout
+cr_dm
+        ; Mark message as handled
+        lda     #CAN_RXF_       ; Write 1 to clear the flag
+        sta     CANRFLG
+
+        pulh
+        rti
+
+; ===================== IT VECTORS ==========================================
+#VECTORS
+
+        org     Vcanrx
+        dw      CAN_Rx_IT
+
+

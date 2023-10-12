@@ -1,0 +1,599 @@
+; ==============================================================================
+;                          HEATER MOTOR CONTROL
+; ==============================================================================
+; Hardware: https://github.com/butyi/sci2can/
+; Software: https://github.com/butyi/heaterpwm/
+; ==============================================================================
+XTAL            def     4000000 ; Quarz in Hz
+BDIV            def     1
+RDIV            def     128
+#include "dz60.inc"             ; Include microcontroller specific definitions
+; ===================== CONFIG =================================================
+
+IS_DISPLAY      equ     1       ; Define if display is available for debug purpose in IIC
+
+ST_TRESHHOLD    equ     30      ; Switch Time Threshold in 10ms. Short pulse: state<ST_TRESHHOLD, Long pulse: state>ST_TRESHHOLD
+FILT_MAX        equ     10      ; Switch input filter time in 10ms.
+
+LEVEL_OFF       equ     0       ; Level in Off state
+LEVEL_LOW_1     equ     4       ; Level when Low comes from Off
+LEVEL_LOW_2     equ     6       ; Level when Low comes from High (original low level was 60%)
+LEVEL_HIGH      equ     9       ; Level in High state
+
+ADC_CAL_U       equ     213     ; Voltage measured during calibration in 0.1V resolution
+ADC_CAL_V       equ     102     ; ADC value when measuring ADC_CAL_U voltage
+
+UNDERVOLTAGE    equ     110     ; PWM inhibit voltage level in 0.1V resolution
+
+; uC port definitions with line names in schematic
+LED2            @pin    PTA,6   ; Status LED
+CANRX           @pin    PTE,7
+CANTX           @pin    PTE,6
+RxD1            @pin    PTE,1   ; Same circuit as IN1
+RxD1_2          @pin    PTA,0	; Same circuit as RxD1
+IN2             @pin    PTA,1
+FET1            @pin    PTD,2   ; PWM output port
+FET             @pin    PTD,3   ; PWM output port
+SW_L            @pin    PTE,3   ; Left developer board button
+SW_R            @pin    PTE,2   ; Right developer board button
+
+; ===================== INCLUDE FILES ==========================================
+
+#include "cop.a08"              ; Watchdog module functions
+#include "mcg.a08"              ; Clock Generator functions
+#include "rtc.a08"              ; Real-Time Counter functions
+#ifdef IS_DISPLAY
+  #include "iic.a08"            ; I2C communication functions
+  #include "ssd1780.a08"        ; 0.96" 128x64 OLED display driver
+#endif
+#include "lib.a08"              ; General helper functions
+#include "adc.a08"              ; Analogue-Digital Converter functions
+#include "pwm.a08"              ; Timer module functions for PWM output
+#include "can.a08"              ; Demand can come from CAN
+
+; ====================  VARIABLES  =============================================
+#RAM
+
+uz_filt         ds      2       ; Filtered Uz value
+tmp             ds      2       ; General purpose variable
+uz              ds      1       ; Uz in 0.1 voltage (E.g. 144 = 14.4V)
+switch          ds      1       ; Rotate switch state (0=Off, 1=Low, 2=high) on low nibble, previous state in high nibble
+motorlevel      ds      1       ; Level of motor PWM (e.g. 0=0%, 1=10%, 2=20%)
+pwmpercent      ds      1       ; PWM duty in percent
+offdur          ds      1       ; Time in 10ms of length of Off switch state (0...2,55s)
+highdur         ds      1       ; Time in 10ms of length of High switch state (0...2,55s)
+offdelay        ds      1       ; Time in 10ms after Low is changed to Off (0...2,55s)
+highdelay       ds      1       ; Time in 10ms after Low is changed to High (0...2,55s)
+
+off_filt        ds      1       ; Filter for Off switch state against instable connection and to cover short Off time between Low and High state
+low_filt        ds      1       ; Filter for Low switch state against instable connection
+high_filt       ds      1       ; Filter for High switch state against instable connection
+
+#ifdef IS_DISPLAY
+disp_uz         ds      1       ; Currently displayed value to detect change
+disp_switch     ds      1       ; and update display only if value has been
+disp_motorlevel ds      1       ; changed.
+disp_pwmpercent ds      1       ; --||--
+disp_offdur     ds      1       ; --||--
+disp_offdelay   ds      1       ; --||--
+disp_highdur    ds      1       ; --||--
+disp_highdelay  ds      1       ; --||--
+#endif
+
+; ====================  PROGRAM START  =========================================
+#ROM
+
+start:
+        sei                     ; disable interrupts
+
+        ldhx    #XRAM_END       ; H:X points to SP
+        txs                     ; Init SP
+
+#ifdef IS_DISPLAY
+        ldx     #255            ; Wait for boot up the display board
+        lda     #255            ; without this, init is often lost and
+        dbnza   $               ; display remains dark
+        dbnzx   $-4
+#endif
+
+        jsr     COP_Init        ; Init watchdog
+        jsr     PTX_Init        ; I/O ports initialization
+        jsr     MCG_Init        ; Set clock to external 4MHz quarz
+        jsr     RTC_Init        ; Init periodic interrupt
+        jsr     ADC_Init        ; Init analogue-digital converter
+        jsr     PWM_Init        ; Init timer for PWM output
+        jsr     CAN_Init        ; Init CAN for receive demand
+
+#ifdef IS_DISPLAY
+        jsr     IIC_Init        ; Init IIC
+
+        ; Init global variables for display to 255 to force an update after startup
+	lda	#$FF
+	sta     disp_uz
+        sta     disp_switch
+        sta     disp_motorlevel
+        sta     disp_pwmpercent
+        sta     disp_offdur
+        sta     disp_offdelay
+        sta     disp_highdur
+        sta     disp_highdelay
+#endif
+
+        ; Init global variables
+        clr     uz_filt
+        clr     uz_filt+1
+        clr     switch
+        clr     motorlevel
+        clr     pwmpercent
+	mov     #ST_TRESHHOLD*2,offdur ; Reason of not 'clr' is to start Low after power on, if switch remained in Low state 
+	clr     offdelay
+        clr     highdur
+	clr     highdelay
+        clr     off_filt
+        clr     low_filt
+        clr     high_filt
+
+        cli                     ; Enable interrupts
+
+#ifdef IS_DISPLAY
+        ; Print display background
+        jsr     IIC_wfe         ; Wait for end of action list
+        jsr     DISP_init       ; Initialize display
+        lda     #$00            ; Set position to top-left
+        ldhx    #startscreen    ; Get address of string
+        jsr     DISP_print      ; Print string
+        jsr     IIC_wfe         ; Wait for end of action list
+
+#endif
+
+main:
+        jsr     KickCop         ; Update watchdog
+        jsr     CANTask         ; Handle CAN timeout
+
+#ifdef IS_DISPLAY
+        ; Print battery voltage
+        lda     uz              ; Load current value
+        cmp     disp_uz         ; Compare with currently displayed value
+        beq     disp1           ; Jump through the display update is no change
+        sta     disp_uz         ; Save current value as displayed value
+        clrh                    ; Value has no high byte part
+        ldx     #1              ; Length of fractional part is 1 digit
+        mov     #4,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$16            ; Screen position
+        jsr     DISP_print      ; Print string
+disp1
+        ; Print switch state
+        lda     switch
+        cmp     disp_switch
+        beq     disp2
+        sta     disp_switch
+        nsa
+        and     #$0F            ; previous state only
+        clrh
+        clrx                    ; No fractional part
+        mov     #1,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$28            ; Screen position
+        jsr     DISP_print      ; Print string
+        lda     switch
+        and     #$0F            ; current state only
+        clrh
+        clrx                    ; No fractional part
+        mov     #1,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$2A            ; Screen position
+        jsr     DISP_print      ; Print string
+disp2
+        ; Print switch state
+        lda     motorlevel
+        cmp     disp_motorlevel
+        beq     disp3
+        sta     disp_motorlevel
+        clrh
+        clrx                    ; No fractional part
+        mov     #1,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$2E            ; Screen position
+        jsr     DISP_print      ; Print string
+disp3
+        ; Print Off duration and delay
+        lda     offdur
+        cmp     disp_offdur
+        beq     disp4
+        sta     disp_offdur
+        clrh
+        clrx                    ; No fractional part
+        mov     #3,str_bufidx   ; Set length of string
+        jsr     str_val        ; Convert value to string
+        lda     #$35            ; Screen position
+        jsr     DISP_print      ; Print string
+disp4
+        lda     offdelay
+        cmp     disp_offdelay
+        beq     disp5
+        sta     disp_offdelay
+        clrh
+        clrx                    ; No fractional part
+        mov     #3,str_bufidx   ; Set length of string
+        jsr     str_val        ; Convert value to string
+        lda     #$3B            ; Screen position
+        jsr     DISP_print      ; Print string
+disp5
+        ; Print High duration and delay
+        lda     highdur
+        cmp     disp_highdur
+        beq     disp6
+        sta     disp_highdur
+        clrh
+        clrx                    ; No fractional part
+        mov     #3,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$45            ; Screen position
+        jsr     DISP_print      ; Print string
+disp6
+        lda     highdelay
+        cmp     disp_highdelay
+        beq     disp7
+        sta     disp_highdelay
+        clrh
+        clrx                    ; No fractional part
+        mov     #3,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$4B            ; Screen position
+        jsr     DISP_print      ; Print string
+disp7
+        ; Print PWM percentage
+        lda     pwmpercent
+        cmp     disp_pwmpercent
+        beq     disp8
+        sta     disp_pwmpercent
+        clrh
+        clrx                    ; No fractional part
+        mov     #3,str_bufidx   ; Set length of string
+        jsr     str_val         ; Convert value to string
+        lda     #$58            ; Screen position
+        jsr     DISP_print      ; Print string
+disp8
+        jmp     main
+#else
+        bra     main
+#endif
+
+
+
+; -------------------------------------------------------------
+; Measure battery voltage and apply low pass filter on that
+; Call: 10ms periodic interrupt
+; Input: Analogue input port
+; Output: filtered uz byte, value in 0.1V (e.g. 144 = 14.4V)
+; -------------------------------------------------------------
+meas_uz:
+        ; Read Uz value
+        lda     #PIN5.          ; Select power supply (UZ_MEAS) PTA5
+#ifdef IS_DISPLAY
+        jsr     ADC_read        ; Read Uz voltage
+#else
+        bsr     ADC_read        ; Read Uz voltage
+#endif
+        ; Save Uz value into tmp
+        sta     tmp             ; Save value in Hi byte
+        clr     tmp+1           ; Clear Lo byte
+        ; Divide Uz value by 8
+        lsr     tmp             ; Shift 16bits right -> div by 2
+        ror     tmp+1
+        lsr     tmp             ; Shift 16bits right -> div by 2
+        ror     tmp+1
+        lsr     tmp             ; Shift 16bits right -> div by 2
+        ror     tmp+1           ; Div by 8 all together above
+
+        ; Now comes 32bit long calculations
+        clr     arit32          ; Load uz to arit32
+        clr     arit32+1
+        mov     uz_filt,arit32+2
+        mov     uz_filt+1,arit32+3
+
+        clr     yy              ; *=7
+        clr     yy+1
+        clr     yy+2
+        mov     #7,yy+3
+
+        jsr     szor16bit
+
+        clr     yy              ; /=8
+        clr     yy+1
+        clr     yy+2
+        mov     #8,yy+3
+
+        jsr     oszt32bit
+
+        lda     arit32+3        ; Add value/8 (tmp) to uz_filt
+        add     tmp+1
+        sta     uz_filt+1
+        lda     arit32+2
+        adc     tmp
+        sta     uz_filt
+
+        ; Apply scale to have value in voltage (uz_filt is still in A)
+        ldx     #ADC_CAL_U      ; *=50 (5V)
+        mul                     ; (X) * (A) -> X:A
+        pshx                    ; Move X
+        pulh                    ;        to H
+        ldx     #ADC_CAL_V      ; /=23 (ADC value when measuring 5V)
+        div                     ; (H:A) / (X) -> A ; Remainder -> H
+        sta     uz              ; Save as phisical voltage
+
+        rts
+
+; -------------------------------------------------------------
+; Read in switch from digit inputs and filter instability
+; Call: 10ms periodic interrupt
+; Input: Digit input ports
+; Output: switch (0,1,2)
+; -------------------------------------------------------------
+read_switch:
+        lda     IN2             ; Read port with switch inputs
+        and     #RxD1_2_|IN2_   ; Check only these bits
+        beq     rsw_off         ; Off state
+        cmp     #RxD1_2_
+        beq     rsw_low         ; Low state only
+
+        ; Switch is in High state (High or both Low and High)
+        @decm   off_filt,0
+        @decm   low_filt,0
+        @incm   high_filt,FILT_MAX+1
+        bra     rsw_switch
+
+        ; Switch is in Off state
+rsw_off
+        @incm   off_filt,FILT_MAX+1
+        @decm   low_filt,0
+        @decm   high_filt,0
+        bra     rsw_switch
+
+        ; Switch is in Low state
+rsw_low                          ; Different motor speed depends on which was the switch state previously
+        @decm   off_filt,0
+        @incm   low_filt,FILT_MAX+1
+        @decm   high_filt,0
+rsw_switch
+
+
+        ; Check Off state based on filt counters
+        lda     off_filt
+        cmp     #FILT_MAX
+        blo     rsw_n_off       ; Not Off state
+        lda     low_filt
+        cmp     #1
+        bhi     rsw_n_off       ; Not Off state
+        lda     high_filt
+        cmp     #1
+        bhi     rsw_n_off       ; Not Off state
+        @incm   offdur,ST_TRESHHOLD*2
+        @decm   highdur,0
+        ; Set new switch state to Off
+        lda     switch
+        nsa
+        and     #$F0
+        sta     switch
+rsw_n_off
+        ; Check Low state based on filt counters
+        lda     off_filt
+        cmp     #1
+        bhi     rsw_n_low       ; Not Low state
+        lda     low_filt
+        cmp     #FILT_MAX
+        blo     rsw_n_low       ; Not Low state
+        lda     high_filt
+        cmp     #1
+        bhi     rsw_n_low       ; Not Low state
+        @decm   offdur,0
+        @decm   highdur,0
+        ; Set new switch state to Low
+        lda     switch
+        nsa
+        and     #$F0
+        ora     #1
+        sta     switch
+rsw_n_low
+        ; Check High state based on filt counters
+        lda     off_filt
+        cmp     #1
+        bhi     rsw_n_high      ; Not High state
+        lda     low_filt
+        cmp     #1
+        bhi     rsw_n_high      ; Not High state
+        lda     high_filt
+        cmp     #FILT_MAX
+        blo     rsw_n_high      ; Not High state
+        @decm   offdur,0
+        @incm   highdur,ST_TRESHHOLD*2
+        ; Set new switch state to High
+        lda     switch
+        nsa
+        and     #$F0
+        ora     #2
+        sta     switch
+rsw_n_high
+        rts
+
+
+; -------------------------------------------------------------
+; Calculate motor level from changes of switch
+; Call: 10ms periodic interrupt
+; Input: switch (0,1,2)
+; Output: motorlevel (0...9)
+; -------------------------------------------------------------
+calc_motor:
+        lda     switch
+        cmp     #$01            ; $01 means previously it was 0, but now it is 1
+        bne     cm_1
+        lda     offdur
+        cmp     #ST_TRESHHOLD
+        blo     cm_1s
+        mov     #LEVEL_LOW_1,motorlevel
+        bra     cm_e
+cm_1s
+        clr     offdelay
+        @decm   motorlevel,LEVEL_OFF+1
+        bra     cm_e
+cm_1
+        lda     switch
+        cmp     #$21
+        bne     cm_2
+        lda     highdur
+        cmp     #ST_TRESHHOLD
+        blo     cm_2s
+        mov     #LEVEL_LOW_2,motorlevel
+        bra     cm_e
+cm_2s
+        clr     highdelay
+        @incm   motorlevel,LEVEL_HIGH-1
+        bra     cm_e
+cm_2
+        lda     switch
+        cmp     #$10
+        bne     cm_3
+        mov     #ST_TRESHHOLD,offdelay
+        bra     cm_e
+cm_3
+        lda     switch
+        cmp     #$20
+        bne     cm_4
+        mov     #ST_TRESHHOLD,offdelay
+        bra     cm_e
+cm_4
+        lda     switch
+        cmp     #$02
+        bne     cm_5
+        mov     #ST_TRESHHOLD,highdelay
+        bra     cm_e
+cm_5
+        cmp     #$12
+        bne     cm_e
+        mov     #ST_TRESHHOLD,highdelay
+cm_e
+        ; Delayed Off
+        lda     offdelay
+        cmp     #1
+        bne     cm_do
+        clr     motorlevel
+cm_do
+        @decm   offdelay,0
+
+        ; Delayed High
+        lda     highdelay
+        cmp     #1
+        bne     cm_dh
+        mov     #LEVEL_HIGH,motorlevel
+cm_dh
+        @decm   highdelay,0
+        rts
+
+; -------------------------------------------------------------
+; Update PWM value based on motorlevel and inhibit at low battery voltage
+; Call: 10ms periodic interrupt
+; Input: motorlevel variable
+; Output: PWM percent (0%...100%) for TPM1C1VL
+; -------------------------------------------------------------
+write_pwm:
+        ; Update PWM value from switch
+        ldhx    #pwmvalues      ; Load PWM value table address
+        lda     motorlevel      ; motorlevel to be the offset
+        jsr     addhxanda       ; Apply offset
+        lda     ,x              ; Load byte from HX address
+        sta     pwmpercent
+
+        ; CAN demand has priority over local input
+        lda     canpwm
+        cmp     #100            ; Check for maximum percent
+        bhi     wp_nocan        ; if more than 100% (or SNA), do not use
+        sta     pwmpercent
+wp_nocan
+
+        ; Supply power inhibit if needed
+        lda     uz              ; Check supply voltage
+        cmp     #UNDERVOLTAGE
+        bhi     voltage_ok      ; Voltage is higher than inhibit
+        clr     pwmpercent      ; Voltage inhibit, motor off
+        mov     #5,led_period   ; Show inhibit by fast status LED
+        bra     voltage_end
+voltage_ok
+        mov     #NORMAL_PERIOD,led_period ; No inhibit, normal status LED period
+voltage_end
+        lda     pwmpercent      ; Load requested PWM duty
+	jsr	SetPWMpercent	; Store to PWM register
+        rts
+
+;------------------------------------------------------------------------------
+; ===================== STRINGS ================================================
+
+#ifdef IS_DISPLAY
+;hexakars
+;       db '0123456789ABCDEF'
+startscreen
+        db "Heater Motor PWM"
+        db "   Uz       V   "
+        db " Switch _ _ - _ "
+        db " Off ___ - ___  "   ; duration and delay
+        db " Hig ___ - ___  "   ; duration and delay
+        db "   PWM  ___ %   "
+        db "  www.butyi.hu  "
+        db "Build {:year-2000}{:month(z)}{:date(z)}{:hour(z)}{:min(z)}"
+        db 0
+#endif
+
+; Convert motorlevel values to PWM values
+pwmvalues
+        ;       0  1  2  3  4  5  6  7  8  9  10     motorlevel
+        db      0,20,30,40,50,60,70,80,90,100,0    ; PWM value
+; 10% is not used, because it is not enough to start motor due to friction torque.
+
+
+; ===================== SUB-ROUTINES ===========================================
+
+; ------------------------------------------------------------------------------
+; Parallel Input/Output Control
+; To prevent extra current consumption caused by flying not connected input
+; ports, all ports shall be configured as output. I have configured ports to
+; low level output by default.
+; There are only a few exceptions for the used ports, where different
+; initialization is needed.
+; Default init states are proper for OSCILL_SUPP pins, no exception needed.
+PTX_Init:
+        ; All ports to be low level
+        clra
+        sta     PTA
+        sta     PTB
+        sta     PTC
+        sta     PTD
+        sta     PTE
+        sta     PTF
+        sta     PTG
+        bset    CANTX.,CANTX    ; CANTX to be high
+        bset    LED2.,LED2      ; LED2 to be On
+
+        ; All ports to be output
+        lda     #$FF
+        sta     DDRA
+        sta     DDRB
+        sta     DDRC
+        sta     DDRD
+        sta     DDRE
+        sta     DDRF
+        sta     DDRG
+        bclr    CANRX.,CANRX+1  ; CANRX to be input
+        bclr    RxD1.,RxD1+1    ; RxD1 to be input
+        bclr    RxD1_2.,RxD1_2+1 ; RxD1_2 to be input
+        bclr    IN2.,IN2+1      ; RxD1_2 to be input
+
+        rts
+
+
+; ===================== IT VECTORS =============================================
+#VECTORS
+
+        org     Vreset
+        dw      start
+
+; ===================== END ====================================================

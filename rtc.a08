@@ -1,0 +1,93 @@
+; ====================  VARIABLES  =============================================
+#RAM
+
+NORMAL_PERIOD   equ     50      ; Normal status led toggle time in 10ms
+
+led_timer       ds      1       ; Timer for flash status LED
+led_period      ds      1       ; Period for flash status LED in 10ms
+
+cntdwntimers                    ; pointer to first timer
+timeout         ds      1       ; Timeout timer for loops. 
+canrxto         ds      1       ; Timeout timer for CAN reception 
+cantxhb         ds      1       ; Timeer for send heartbit message 
+cntdwntimcnt    equ     $-cntdwntimers  ; Calculate number of timers
+
+timeevents      ds      1       ; Time related cyclic event bits 
+                @bitnum EVERY10MS,7
+                
+
+; ===================== Sub-Routines ==========================================
+#ROM
+
+; ------------------------------------------------------------------------------
+; Real-Time Counter (S08RTCV1)
+; This is periodic timer. (Like PIT in AZ60, TBM in GZ60 in the past) 
+;  - Use interrupt to handle software timer variables (RTIE = 1)
+;  - Select external clock (RTCLKS = 1)
+;  - RTCPS = 11 (10^4 means 4MHz/10000 = 400Hz)
+;  - RTCMOD = 3 (400Hz/4 = 100Hz -> 10ms)
+; This will result 1s periodic interrupt.
+RTC_Init
+        ; Set up registers
+        mov     #RTIE_|RTCLKS0_|11,RTCSC
+        mov     #3,RTCMOD
+
+        clr     led_timer
+        clr     timeevents
+
+        ; foreach(timers as timer)timer=0;
+        clrh
+        ldx     #cntdwntimcnt
+RTC_I_timloop
+        clr     cntdwntimers-1,x ; Clear timer
+        dbnzx   RTC_I_timloop
+
+        mov     #NORMAL_PERIOD,led_period
+        
+        rts
+
+; RTC periodic interrupt service routine, hits in every 10ms
+; This is used only to flash status LED.
+RTC_IT
+        bset    RTIF.,RTCSC     ; Clear flag
+        pshh                            ; Save H, because ISR will use it
+
+        ; Handle Status LED
+        inc     led_timer
+        lda     led_timer
+        cmp     led_period
+        blo     RTC_IT_noledtoggle
+        clr     led_timer
+        lda     LED2            ; |
+        eor     #LED2_          ; + Toggle status LED
+        sta     LED2            ; |
+RTC_IT_noledtoggle
+
+        ; foreach(timers as timer)if(timer)timer--;
+        clrh
+        ldx     #cntdwntimcnt
+RTC_IT_timloop
+        lda     cntdwntimers-1,x ; Check timer
+        beq     RTC_IT_nodec    ; If already null, no dec needed, jump
+        deca                    ; Decrement
+        sta     cntdwntimers-1,x ; Save timer
+RTC_IT_nodec
+        dbnzx   RTC_IT_timloop
+        
+
+        jsr     meas_uz
+        jsr     read_switch
+        jsr     calc_motor
+        jsr     write_pwm
+
+        pulh                            ; Restore H
+        rti
+        
+
+; ===================== IT VECTORS ==========================================
+#VECTORS
+
+        org     Vrtc
+        dw      RTC_IT
+
+

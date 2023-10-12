@@ -1,0 +1,18 @@
+; ===================== SUB-ROUTINES ===========================================
+#ROM
+
+; Timer module initialization for PWM output
+PWM_Init
+        mov     #$0A,TPM1SC     ; TOF=0, TOIE=0, CPWMS=0, CLKS=01(bus), PS=010(/4)
+        clr     TPM1MODH        ; High byte is not needed due to 0-100 range
+        mov     #100,TPM1MODL   ; (8MHz/4/100=20kHz)
+        mov     #$28,TPM1C1SC   ; CH0F=0, CH0IE=0, MS0B=1, MS0A=0(Dontcare), ELS0B=1, ELS0A=0
+        clr     TPM1C1VH        ; High byte is not needed due to 0-100 range
+        mov     #0,TPM1C1VL     ; Set init duty cycle
+	rts
+        
+SetPWMpercent
+        clr     TPM1C1VH        ; High byte is not needed due to 0-100 range
+	sta     TPM1C1VL        ; Set init duty cycle in percent (0-100)
+        rts
+
